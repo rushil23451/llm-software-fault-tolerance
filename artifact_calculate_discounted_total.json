@@ -1,0 +1,12 @@
+{
+  "entry_point": "calculate_discounted_total",
+  "spec": "def calculate_discounted_total(subtotal: float, discount: float) -> float:\n    \"\"\"\n    Return the order total after applying a fractional discount to the subtotal.\n    discount=0.1 means 10% off. Result is rounded to 2 decimal places.\n\n    >>> calculate_discounted_total(100.0, 0.1)\n    90.0\n    >>> calculate_discounted_total(0.0, 0.5)\n    0.0\n    >>> calculate_discounted_total(47.97, 0.1)\n    43.17\n    \"\"\"\n",
+  "primary_code": "def calculate_discounted_total(subtotal: float, discount: float) -> float:\n    \"\"\"Designed primary: direct multiplicative form.\"\"\"\n    total = subtotal * (1 - discount)\n    return round(total, 2)",
+  "alternates": [
+    "def calculate_discounted_total(subtotal: float, discount: float) -> float:\n    \"\"\"Alternate 1 (algorithmically diverse): subtractive form.\n    Compute the discount amount explicitly, then subtract it.\n    \"\"\"\n    discount_amount = subtotal * discount\n    net_total = subtotal - discount_amount\n    return round(net_total, 2)",
+    "def calculate_discounted_total(subtotal: float, discount: float) -> float:\n    \"\"\"Alternate 2 (algorithmically diverse): accumulator / percentage form.\n    Build the retained fraction stepwise instead of a single expression.\n    \"\"\"\n    retained_fraction = 1.0\n    retained_fraction -= discount\n    cents = int(round(subtotal * retained_fraction * 100))\n    return cents / 100.0"
+  ],
+  "at_code": "def acceptance_test(result, *args) -> bool:\n    \"\"\"Acceptance test for calculate_discounted_total.\n    result: the numeric return value under test.\n    args:   (subtotal, discount) — the original inputs.\n    Returns True only if result is a valid number matching the spec.\n    \"\"\"\n    try:\n        subtotal, discount = args\n        # Reject non-numeric / None results outright (catches missing-return fault).\n        if result is None or not isinstance(result, (int, float)):\n            return False\n        if isinstance(result, bool):\n            return False\n        # Result must be within valid bounds: between 0 and the subtotal.\n        if result < 0 or result > subtotal + 1e-6:\n            return False\n        expected = round(subtotal * (1 - discount), 2)\n        return abs(result - expected) < 0.01\n    except Exception:\n        return False",
+  "generated_at": "2026-08-25T00:00:00",
+  "note": "Pre-generated so the PoC runs offline with no API key. Re-run design_time.py with a GROQ_API_KEY to regenerate these artifacts live."
+}
