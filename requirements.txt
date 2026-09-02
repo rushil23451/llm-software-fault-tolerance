@@ -1,2 +1,9 @@
 flask>=2.2
 requests>=2.28
+# Only needed to regenerate NVP artifacts via design_time_nvp.py (a
+# pre-generated artifact ships in this repo, so runtime does not need it):
+groq>=0.4
+# Optional — used by sandbox.py to kill C++/Java worker processes on timeout:
+psutil>=5.9
+# Only needed by main.py (HumanEval evaluator, not by the billing demos):
+datasets>=2.14
