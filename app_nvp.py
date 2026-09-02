@@ -1,36 +1,33 @@
 """
-app_nvp.py — Flask server for the LA-NVP billing PoC.
+app_nvp.py — Flask server for the LA-NVP billing PoC (pure NVP).
 
 Companion to app.py (the Recovery-Block demo). Same domain (cart -> discount
 -> committed bill), same three SQLite databases (products.db / billing.db /
 history.db), same durable layer (durable.py) — the only thing that changes
-is the fault-tolerance mechanism: RB is replaced by NVP, wired in Shape B
-(optimistic-first-write NVP with vote-driven compensation).
+is the fault-tolerance mechanism: RB is replaced by pure N-Version
+Programming as described in the paper's §3.1.
 
-Endpoints (mirror the RB app 1:1 so the two demos are directly comparable):
-  GET  /              -> the UI (cart + discount + NVP trace + DB viewer)
-  GET  /products      -> catalogue from products.db (read-only)
-  POST /checkout      -> run the durable NVP workflow, return trace
-  GET  /billing       -> current committed bills + durable event history
-  POST /reset         -> re-seed all databases
+Because NVP is a FORWARD error-recovery scheme, the voter arbitrates BEFORE
+any bill is written. The corrupt output of a CCF-poisoned variant NEVER
+reaches billing.db. The happy-path event log is just:
 
-The /checkout route executes Shape B:
+    CHECKPOINT -> WRITE (voter verdict) -> COMMIT
 
-  1. checkpoint                       (durable layer captures pre-fault state)
-  2. run all 3 variants in parallel   (Python + C++ + Java)
-  3. designate the first-to-return as the "first-writer"
-     (its output is DELIBERATELY POISONED for the demo — the NVP analogue of
-      RB's FAULTY_PRIMARY_SRC)
-  4. provisional WRITE of that (bad) result into billing.db      (the damage)
-  5. voter runs across all 3 variant outputs (LLM voter -> hardcoded fallback)
-  6. voter overrules the poisoned first-writer
-  7. ROLLBACK                         (bad row erased — billing.db clean again)
-  8. provisional WRITE + COMMIT       (voter's answer persists)
+The durable layer's rollback() is used ONLY in the exceptional no-consensus
+case, where it just closes an empty transaction (nothing was ever written,
+so nothing is actually undone). This is precisely what the NVP literature
+means when it calls NVP "forward recovery, not backward recovery".
 
-If the voter agrees with the first-writer (e.g. `force_poison_first=False`),
-step 6-8 collapse to a single COMMIT with no rollback.
-
+Endpoints mirror app.py 1:1 so the two demos are directly comparable.
 Runs on port 8081 (RB demo owns 8080) so both can run side-by-side.
+
+/checkout drives:
+  1. checkpoint                    (BEGIN txn on billing.db)
+  2. run all 3 variants in parallel  (Python + C++ + Java, isolated sandboxes)
+  3. optionally poison one variant's output  (CCF injection, post-execution)
+  4. voter arbitrates              (LLM voter -> hardcoded majority fallback)
+  5a. consensus  -> WRITE(voter's verdict) -> COMMIT
+  5b. no consensus -> VOTE_ABORT -> ROLLBACK (empty txn) -> abort
 
 Run:
   python db_setup.py      # once
@@ -71,7 +68,7 @@ def _query(db_path: Path, sql: str, args: tuple = ()) -> list[dict]:
 
 
 def _extract_total(result: dict | None) -> float | None:
-    """Pull the scalar `total` out of a variant's JSON output. None if absent."""
+    """Pull the scalar `total` out of the voter's dict verdict."""
     if not isinstance(result, dict):
         return None
     v = result.get("total")
@@ -122,11 +119,11 @@ def reset():
 
 @app.route("/checkout", methods=["POST"])
 def checkout():
-    payload = request.get_json(force=True)
-    cart          = payload.get("items", [])
-    discount      = float(payload.get("discount", 0.0))
-    inject_ccf    = bool(payload.get("inject_ccf", True))  # demo default: on
-    timeout       = int(payload.get("timeout", 30))
+    payload    = request.get_json(force=True)
+    cart       = payload.get("items", [])
+    discount   = float(payload.get("discount", 0.0))
+    inject_ccf = bool(payload.get("inject_ccf", True))
+    timeout    = int(payload.get("timeout", 30))
 
     if not cart:
         return jsonify({"error": "Cart is empty."}), 400
@@ -152,80 +149,55 @@ def checkout():
     subtotal = round(subtotal, 2)
     items_json = json.dumps(line_items)
 
-    # ── 2. Run the NVP pipeline (Shape B). No DB writes happen inside. ──
+    # ── 2. Run the NVP pipeline (§3.1). No DB writes happen inside. ──
     nvp = nvp_engine.run_with_nvp(
         (subtotal, discount),
         timeout=timeout,
-        force_poison_first=inject_ccf,
+        inject_ccf=inject_ccf,
     )
 
-    first_result_dict = nvp["first_result"]
-    voter_verdict     = nvp["voter_verdict"]
-    first_total       = _extract_total(first_result_dict)
-    voter_total       = _extract_total(voter_verdict)
+    voter_total = _extract_total(nvp["voter_verdict"])
 
-    # ── 3. Drive the durable workflow using the NVP trace ────────────────
-    #        checkpoint -> provisional-write first -> (rollback + rewrite)? -> commit
+    # ── 3. Drive the durable workflow. ───────────────────────────────────
+    #        Happy path: checkpoint -> WRITE(voter verdict) -> COMMIT.
+    #        No-consensus: checkpoint -> VOTE_ABORT -> ROLLBACK (empty txn).
     wf = DurableWorkflow()
     try:
         wf.checkpoint(
             f"pre-billing snapshot (subtotal={subtotal}, discount={discount})")
 
-        wf.provisional_write_bill(
-            items_json, subtotal, discount,
-            total=first_total, status="PENDING",
-            version=f"first-writer:{nvp['first_lang']}"
-                    + (" (poisoned)" if inject_ccf and first_result_dict is not None else ""),
-        )
-
-        if not nvp["success"]:
-            # No consensus across variants — abort like RB does when all alts fail.
-            wf.log_event(
-                "VOTE_ABORT",
-                "voter reached no consensus (fewer than 2 non-crashed "
-                "variants agreed) — the workflow cannot commit a bill.")
-            wf.rollback("no NVP consensus — provisional first-write undone")
-            wf.log_event("ABORT", "all variants exhausted — no bill written")
-            final = {"total": None, "version": "none", "recovered": False}
-
-        elif nvp["overruled"]:
-            # Voter disagrees with the first-writer. This is the demo's key arc:
-            # the corrupt provisional write must be rolled back and replaced
-            # with the voter's answer.
-            wf.log_event(
-                "VOTE_OVERRULE",
-                f"voter ({nvp['voter_used']}) overrules first-writer "
-                f"({nvp['first_lang']}): first_total={first_total!r} vs "
-                f"voter_total={voter_total!r} — corrupt bill must not persist.")
-            wf.rollback(f"voter overruled — {nvp['first_lang']} produced "
-                        f"first_total={first_total!r}")
-
+        if nvp["success"]:
             wf.provisional_write_bill(
                 items_json, subtotal, discount,
                 total=voter_total, status="COMMITTED",
                 version=nvp["final_version"])
             wf.commit(
-                f"recovered via voter ({nvp['voter_used']}) — correct bill "
-                f"total={voter_total} committed")
-            final = {"total": voter_total,
-                     "version": nvp["final_version"],
-                     "recovered": True}
-
+                f"voter ({nvp['voter_used']}) reached consensus — bill "
+                f"committed with total={voter_total}")
+            final = {
+                "total":       voter_total,
+                "version":     nvp["final_version"],
+                "masked":      nvp["poisoned_lang"] is not None,
+                "masked_lang": nvp["poisoned_lang"],
+            }
         else:
-            # Voter agrees with the first-writer -> no compensation needed.
-            wf.commit(
-                f"voter ({nvp['voter_used']}) agrees with first-writer "
-                f"({nvp['first_lang']}) — bill committed as-is")
-            final = {"total": voter_total,
-                     "version": nvp["final_version"],
-                     "recovered": False}
+            wf.log_event(
+                "VOTE_ABORT",
+                "voter reached no consensus (fewer than 2 non-crashed "
+                "variants agreed) — no bill can be written.")
+            wf.rollback(
+                "no NVP consensus — transaction closed cleanly "
+                "(no rows were ever provisionally written)")
+            wf.log_event("ABORT", "all variants exhausted — no bill written")
+            final = {"total": None, "version": "none", "masked": False,
+                     "masked_lang": None}
 
         db_events   = wf.trace
         workflow_id = wf.workflow_id
     finally:
         wf.close()
 
-    # ── 4. Read back billing.db to prove it is clean ────────────────────
+    # ── 4. Read back billing.db to prove it is clean ─────────────────────
     bills = _query(
         BILLING_DB,
         "SELECT id, subtotal, discount, total, status, version, created_at "
@@ -234,23 +206,21 @@ def checkout():
         BILLING_DB, "SELECT COUNT(*) AS n FROM bills WHERE total IS NULL")[0]["n"]
 
     return jsonify({
-        "workflow_id":    workflow_id,
-        "subtotal":       subtotal,
-        "discount":       discount,
-        "line_items":     line_items,
-        "nvp_steps":      nvp["steps"],       # FIRST_WRITE / VARIANT_* / VOTE / OVERRULE|AGREE
-        "durable_events": db_events,          # CHECKPOINT / WRITE / VOTE_OVERRULE / ROLLBACK / COMMIT
+        "workflow_id":     workflow_id,
+        "subtotal":        subtotal,
+        "discount":        discount,
+        "line_items":      line_items,
+        "nvp_steps":       nvp["steps"],       # VARIANT_* × 3, VOTE
+        "durable_events":  db_events,          # CHECKPOINT, WRITE, COMMIT (happy path)
         "variant_outputs": nvp["variant_outputs"],
-        "first_lang":     nvp["first_lang"],
-        "first_result":   nvp["first_result"],
-        "voter_used":     nvp["voter_used"],
-        "voter_verdict":  nvp["voter_verdict"],
-        "overruled":      nvp["overruled"],
-        "final":          final,
-        "bills":          bills,
-        "bad_rows":       bad_rows,
-        "success":        nvp["success"],
-        "inject_ccf":     inject_ccf,
+        "voter_used":      nvp["voter_used"],
+        "voter_verdict":   nvp["voter_verdict"],
+        "poisoned_lang":   nvp["poisoned_lang"],
+        "final":           final,
+        "bills":           bills,
+        "bad_rows":        bad_rows,
+        "success":         nvp["success"],
+        "inject_ccf":      inject_ccf,
     })
 
 
@@ -262,7 +232,7 @@ if __name__ == "__main__":
         db_setup.setup_billing()
         db_setup.setup_history()
     print("=" * 64)
-    print("LA-NVP Billing PoC  —  http://localhost:8081")
-    print("3 diverse variants (Py/C++/Java) -> first-write -> voter overrule -> rollback -> recover.")
+    print("LA-NVP Billing PoC (pure NVP)  —  http://localhost:8081")
+    print("3 diverse variants (Py/C++/Java) -> voter masks CCF -> single COMMIT.")
     print("=" * 64)
     app.run(debug=False, port=8081)

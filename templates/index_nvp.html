@@ -51,8 +51,8 @@
   @media(max-width:700px){.variants{grid-template-columns:1fr}}
   .variant{background:var(--panel2);border:1px solid var(--line);border-radius:9px;
     padding:10px 12px;position:relative}
-  .variant.first{border-color:var(--warn);box-shadow:0 0 0 1px rgba(255,180,84,.15) inset}
-  .variant.poisoned{border-color:var(--bad);box-shadow:0 0 0 1px rgba(255,107,107,.18) inset}
+  .variant.poisoned{border-color:var(--bad);
+    box-shadow:0 0 0 1px rgba(255,107,107,.18) inset}
   .variant .head{display:flex;justify-content:space-between;align-items:center;
     margin-bottom:8px}
   .variant .lang{font-weight:700;font-family:var(--mono);font-size:12px;padding:2px 8px;
@@ -61,17 +61,16 @@
   .variant.java .lang{color:var(--java)}
   .variant .flag{font-family:var(--mono);font-size:10px;font-weight:700;
     padding:2px 7px;border-radius:20px}
-  .variant .flag.first{background:rgba(255,180,84,.18);color:var(--warn)}
   .variant .flag.poisoned{background:rgba(255,107,107,.18);color:var(--bad)}
   .variant .val{font-family:var(--mono);font-size:13px;word-break:break-word}
   .variant .note{color:var(--dim);font-size:11px;margin-top:6px}
   .voterow{display:grid;grid-template-columns:74px 1fr auto;gap:10px;align-items:center;
     padding:9px 11px;border-radius:8px;margin-bottom:6px;background:var(--panel2);
     border:1px solid var(--line)}
-  .voterow.overrule{border-color:var(--bad);
-    background:linear-gradient(180deg,rgba(255,107,107,.06),var(--panel2))}
-  .voterow.agree{border-color:var(--good);
+  .voterow.consensus{border-color:var(--good);
     background:linear-gradient(180deg,rgba(62,207,142,.06),var(--panel2))}
+  .voterow.abort{border-color:var(--bad);
+    background:linear-gradient(180deg,rgba(255,107,107,.06),var(--panel2))}
   .tag{font-family:var(--mono);font-size:11px;font-weight:700;text-align:center;
     padding:3px 4px;border-radius:5px;background:#243049;color:var(--dim)}
   .voterow .val{font-family:var(--mono);font-size:12px;color:var(--ink);
@@ -81,14 +80,14 @@
   .pass{background:rgba(62,207,142,.15);color:var(--good)}
   .fail{background:rgba(255,107,107,.15);color:var(--bad)}
   /* event log */
-  .ev{display:grid;grid-template-columns:26px 130px 1fr;gap:8px;padding:5px 8px;
+  .ev{display:grid;grid-template-columns:26px 118px 1fr;gap:8px;padding:5px 8px;
     font-size:12px;border-left:2px solid var(--line);margin-left:2px}
   .ev .seq{color:var(--dim);font-family:var(--mono)}
   .ev .et{font-family:var(--mono);font-weight:700;font-size:11px}
   .ev .dt{color:var(--dim);font-family:var(--mono);word-break:break-word}
   .et-CHECKPOINT{color:var(--accent)} .et-WRITE{color:var(--warn)}
-  .et-VOTE_OVERRULE{color:var(--bad)} .et-VOTE_ABORT{color:var(--bad)}
-  .et-ROLLBACK{color:var(--bad)} .et-COMMIT{color:var(--good)}
+  .et-COMMIT{color:var(--good)}
+  .et-VOTE_ABORT{color:var(--bad)} .et-ROLLBACK{color:var(--bad)}
   .et-ABORT{color:var(--bad)}
   table{width:100%;border-collapse:collapse;font-size:12px}
   th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);
@@ -107,11 +106,13 @@
 </style>
 
 <header>
-  <h1>LA-NVP Billing — Concurrent N-Version Programming Demo</h1>
-  <p>Three algorithmically-diverse variants (Python + C++ + Java) run in parallel →
-     the first to return is provisionally written to <code>billing.db</code> →
-     a voter arbitrates across all three → if the voter overrules the first-writer,
-     the durable layer rolls the corrupt row back and commits the majority answer.</p>
+  <h1>LA-NVP Billing — Pure N-Version Programming Demo</h1>
+  <p>Three algorithmically-diverse variants (Python + C++ + Java) run in
+     parallel in isolated subprocess sandboxes → a hierarchical voter (LLM
+     voter → hardcoded majority fallback) arbitrates their outputs BEFORE any
+     bill is written. Fault masking is forward-only: the corrupt output of a
+     CCF-poisoned variant never reaches <code>billing.db</code> — no rollback
+     is needed.</p>
 </header>
 
 <div class="wrap">
@@ -134,7 +135,7 @@
       </div>
       <div class="toggle">
         <input id="injectCcf" type="checkbox" checked>
-        <label for="injectCcf">Poison first-writer (CCF injection — shows recovery)</label>
+        <label for="injectCcf">Poison one variant (CCF — voter must mask it)</label>
       </div>
       <button class="cta" id="checkout">Run NVP checkout</button>
       <div class="row-actions">
@@ -150,10 +151,12 @@
 
     <div class="card">
       <h2>NVP variants (concurrent execution)</h2>
-      <div id="variantTiles"><div class="empty">Run a checkout to see all three variants side by side.</div></div>
+      <div class="variants" id="variantTiles">
+        <div class="empty" style="grid-column:1/-1">Run a checkout to see all three variants side by side.</div>
+      </div>
 
-      <h2 style="margin-top:14px">Voter &amp; verdict</h2>
-      <div id="voteRows"><div class="empty">The voter's verdict and overrule/agree decision appears here.</div></div>
+      <h2 style="margin-top:14px">Voter verdict</h2>
+      <div id="voteRows"><div class="empty">The voter's verdict appears here.</div></div>
     </div>
 
     <div class="card">
@@ -240,57 +243,50 @@ function renderResults(d){
   if(d.success){
     const f = d.final;
     const totStr = f.total==null ? '—' : `$${(+f.total).toFixed(2)}`;
+    const maskedNote = f.masked
+      ? ` <span class="muted">(voter masked a CCF-poisoned ${f.masked_lang} variant — no write of the corrupt value occurred)</span>`
+      : '';
     $('#finalBox').innerHTML = `<div class="final ok">
-      ✔ Bill committed. Total <b>${totStr}</b> produced by
-      <b>${f.version}</b>${f.recovered ? ' (recovered from a corrupt first-write)' : ''}.
-      Corrupt rows in billing.db: <b>${d.bad_rows}</b>.</div>`;
+      ✔ Bill committed. Total <b>${totStr}</b> from
+      <b>${f.version}</b>.${maskedNote} Corrupt rows in billing.db: <b>${d.bad_rows}</b>.</div>`;
   } else {
     $('#finalBox').innerHTML = `<div class="final err">
       ✘ No NVP consensus — no bill written. billing.db untouched.</div>`;
   }
 
   // variant tiles
-  const langOrder = ['python','c++','java'];
-  const cssClass = {'python':'py','c++':'cpp','java':'java'};
-  const displayName = {'python':'Python','c++':'C++','java':'Java'};
+  const langOrder    = ['python','c++','java'];
+  const cssClass     = {'python':'py','c++':'cpp','java':'java'};
+  const displayName  = {'python':'Python','c++':'C++','java':'Java'};
   $('#variantTiles').innerHTML = langOrder.map(l => {
     const out = d.variant_outputs[l];
-    const isFirst = (d.first_lang === l);
-    const isPoisoned = isFirst && d.inject_ccf && out !== null;
+    const isPoisoned = (d.poisoned_lang === l);
     const classes = ['variant', cssClass[l]];
-    if(isFirst) classes.push('first');
     if(isPoisoned) classes.push('poisoned');
-    const flag = isPoisoned
-      ? `<span class="flag poisoned">FIRST · POISONED</span>`
-      : (isFirst ? `<span class="flag first">FIRST WRITER</span>` : '');
+    const flag = isPoisoned ? `<span class="flag poisoned">CCF POISONED</span>` : '';
     return `<div class="${classes.join(' ')}">
       <div class="head">
         <span class="lang">${displayName[l]}</span>
         ${flag}
       </div>
       <div class="val">${out===null ? '<span class="fail">crashed / timeout</span>' : fmt(out)}</div>
-      ${isFirst ? '<div class="note">provisionally written to billing.db</div>' : ''}
+      ${isPoisoned ? '<div class="note">voter must mask this before any DB write</div>' : ''}
     </div>`;
   }).join('');
 
   // vote strip
   const voteStep = d.nvp_steps.find(s => s.stage === 'VOTE');
-  const decisionStep = d.nvp_steps.find(s => s.stage === 'OVERRULE' || s.stage === 'AGREE');
-  const voteHtml = voteStep ? `
-    <div class="voterow">
-      <span class="tag">VOTE</span>
-      <span class="val">voter=${d.voter_used}  verdict=${fmt(voteStep.result)}</span>
-      <span class="verdict ${voteStep.result?'pass':'fail'}">${voteStep.result?'CONSENSUS':'NO CONSENSUS'}</span>
-    </div>` : '';
-  const decHtml = decisionStep ? `
-    <div class="voterow ${decisionStep.stage==='OVERRULE'?'overrule':'agree'}">
-      <span class="tag">${decisionStep.stage}</span>
-      <span class="val">${decisionStep.note}</span>
-      <span class="verdict ${decisionStep.stage==='OVERRULE'?'fail':'pass'}">
-        ${decisionStep.stage==='OVERRULE'?'ROLLBACK + REWRITE':'COMMIT AS-IS'}
-      </span>
-    </div>` : '';
-  $('#voteRows').innerHTML = voteHtml + decHtml || '<div class="empty">No vote recorded.</div>';
+  if(voteStep){
+    const consensus = voteStep.result !== null && voteStep.result !== undefined;
+    $('#voteRows').innerHTML = `
+      <div class="voterow ${consensus?'consensus':'abort'}">
+        <span class="tag">VOTE</span>
+        <span class="val">voter=<b>${d.voter_used}</b> · verdict=${fmt(voteStep.result)}</span>
+        <span class="verdict ${consensus?'pass':'fail'}">${consensus?'CONSENSUS → COMMIT':'NO CONSENSUS → ABORT'}</span>
+      </div>`;
+  } else {
+    $('#voteRows').innerHTML = '<div class="empty">No vote recorded.</div>';
+  }
 
   // durable events
   $('#events').innerHTML = d.durable_events.map(e => `
@@ -339,7 +335,7 @@ $('#reset').onclick = async () => {
   await fetch('/reset', {method:'POST'});
   cart.clear(); renderCart();
   $('#finalBox').innerHTML = '';
-  $('#variantTiles').innerHTML = '<div class="empty">Databases reset. Run a checkout.</div>';
+  $('#variantTiles').innerHTML = '<div class="empty" style="grid-column:1/-1">Databases reset. Run a checkout.</div>';
   $('#voteRows').innerHTML = '<div class="empty">No vote yet.</div>';
   $('#events').innerHTML = '<div class="empty">Cleared.</div>';
   $('#bills').innerHTML = '<div class="empty">No bills yet.</div>';
